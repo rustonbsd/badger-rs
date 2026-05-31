@@ -1,8 +1,10 @@
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::fmt;
+use std::path::Path;
 use std::ptr;
 
-pub type Result<T> = std::result::Result<T, Error>;
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, BadgerError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
@@ -21,8 +23,45 @@ pub enum Status {
     Unknown = 11,
 }
 
-impl Status {
-    fn from_i32(value: i32) -> Self {
+impl From<Status> for BadgerError {
+    fn from(value: Status) -> Self {
+        match value {
+            Status::InvalidArgument => BadgerError::InvalidArgument("unknown".to_string()),
+            Status::InvalidHandle => BadgerError::InvalidHandle,
+            Status::NotFound => BadgerError::NotFound,
+            Status::EmptyKey => BadgerError::EmptyKey,
+            Status::DiscardedTxn => BadgerError::DiscardedTxn,
+            Status::DbClosed => BadgerError::DbClosed,
+            Status::TxnConflict => BadgerError::TxnConflict,
+            Status::ReadOnlyTxn => BadgerError::ReadOnlyTxn,
+            Status::InvalidEncryptionKey => BadgerError::InvalidEncryptionKey,
+            Status::InvalidValueLogSize => BadgerError::InvalidValueLogSize,
+            Status::Unknown => BadgerError::Unknown,
+            _ => BadgerError::Unknown,
+        }
+    }
+}
+
+impl From<BadgerError> for Status {
+    fn from(value: BadgerError) -> Self {
+        match value {
+            BadgerError::InvalidArgument(_) => Self::InvalidArgument,
+            BadgerError::InvalidHandle => Self::InvalidHandle,
+            BadgerError::NotFound => Self::NotFound,
+            BadgerError::EmptyKey => Self::EmptyKey,
+            BadgerError::DiscardedTxn => Self::DiscardedTxn,
+            BadgerError::DbClosed => Self::DbClosed,
+            BadgerError::TxnConflict => Self::TxnConflict,
+            BadgerError::ReadOnlyTxn => Self::ReadOnlyTxn,
+            BadgerError::InvalidEncryptionKey => Self::InvalidEncryptionKey,
+            BadgerError::InvalidValueLogSize => Self::InvalidValueLogSize,
+            BadgerError::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<i32> for Status {
+    fn from(value: i32) -> Self {
         match value {
             0 => Self::Ok,
             1 => Self::InvalidArgument,
@@ -40,40 +79,34 @@ impl Status {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Error {
-    status: Status,
-    message: String,
+#[derive(Debug, Error, Clone)]
+pub enum BadgerError {
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("Invalid handle")]
+    InvalidHandle,
+    #[error("Not found")]
+    NotFound,
+    #[error("Empty key")]
+    EmptyKey,
+    #[error("Discarded transaction")]
+    DiscardedTxn,
+    #[error("Database closed")]
+    DbClosed,
+    #[error("Transaction conflict")]
+    TxnConflict,
+    #[error("Read-only transaction")]
+    ReadOnlyTxn,
+    #[error("Invalid encryption key")]
+    InvalidEncryptionKey,
+    #[error("Invalid value log size")]
+    InvalidValueLogSize,
+    #[error("Unknown error")]
+    Unknown,
 }
-
-impl Error {
-    pub fn status(&self) -> Status {
-        self.status
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    fn invalid_argument(message: impl Into<String>) -> Self {
-        Self {
-            status: Status::InvalidArgument,
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpenOptions {
-    pub dir: String,
     pub value_dir: String,
     pub in_memory: bool,
     pub encryption_key: Vec<u8>,
@@ -96,8 +129,13 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(options: &OpenOptions) -> Result<Self> {
-        let dir = to_c_string(&options.dir, "dir")?;
+    pub fn open(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
+        let dir = to_c_string(
+            path.as_ref()
+                .to_str()
+                .ok_or(BadgerError::InvalidArgument("invalid path".to_string()))?,
+            "dir",
+        )?;
         let value_dir = to_c_string(&options.value_dir, "value_dir")?;
         let (key_ptr, key_len) = bytes_arg(&options.encryption_key);
         let mut handle = 0_u64;
@@ -367,7 +405,7 @@ impl Drop for BadgerIterator {
 
 fn to_c_string(value: &str, field: &str) -> Result<CString> {
     CString::new(value)
-        .map_err(|_| Error::invalid_argument(format!("{field} contains an interior NUL byte")))
+        .map_err(|_| BadgerError::InvalidArgument(format!("{field} contains an interior NUL byte")))
 }
 
 fn bool_to_u8(value: bool) -> u8 {
@@ -412,13 +450,16 @@ fn take_error(ptr: *mut c_char) -> String {
 }
 
 fn status_result(status: i32, err_ptr: *mut c_char) -> Result<()> {
-    let status = Status::from_i32(status);
+    let status: Status = status.into();
     if status == Status::Ok {
         return Ok(());
     }
 
-    let message = take_error(err_ptr);
-    Err(Error { status, message })
+    let err = status.into();
+    if matches!(err, BadgerError::InvalidArgument(_)) {
+        return Err(BadgerError::InvalidArgument(take_error(err_ptr)));
+    }
+    Err(err)
 }
 
 mod raw {
@@ -536,10 +577,13 @@ mod tests {
     use super::{Database, IteratorOptions, OpenOptions, Status};
 
     fn open_in_memory() -> Database {
-        Database::open(&OpenOptions {
-            in_memory: true,
-            ..OpenOptions::default()
-        })
+        Database::open(
+            "",
+            &OpenOptions {
+                in_memory: true,
+                ..OpenOptions::default()
+            },
+        )
         .expect("open in-memory db")
     }
 
@@ -584,7 +628,10 @@ mod tests {
 
         assert!(!iter.has_next().expect("iterator exhaustion"));
 
-        let missing = reader.get(b"missing").expect_err("missing key should fail");
-        assert_eq!(missing.status(), Status::NotFound);
+        let missing: Status = reader
+            .get(b"missing")
+            .expect_err("missing key should fail")
+            .into();
+        assert_eq!(missing, Status::NotFound);
     }
 }

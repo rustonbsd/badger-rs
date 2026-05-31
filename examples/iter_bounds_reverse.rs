@@ -15,11 +15,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| String::from("/tmp/badger-iter-example"));
 
-    let db = Database::open(&OpenOptions {
-        dir: path.clone(),
-        value_dir: path.clone(),
-        ..OpenOptions::default()
-    })?;
+    let db = Database::open(
+        &path,
+        &OpenOptions {
+            value_dir: path.clone(),
+            ..OpenOptions::default()
+        },
+    )?;
 
     db.drop_all()?;
     seed(&db)?;
